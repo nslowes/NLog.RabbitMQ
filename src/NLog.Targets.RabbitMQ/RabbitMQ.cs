@@ -1,9 +1,8 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.IO;
-using System.Runtime.CompilerServices;
 using System.Text;
-using System.Threading.Tasks;
+
 using NLog.Common;
 using RabbitMQ.Client;
 using RabbitMQ.Client.Framing.v0_9_1;
@@ -11,6 +10,10 @@ using NLog.Layouts;
 
 namespace NLog.Targets
 {
+	using System.Threading;
+
+	using global::RabbitMQ.Client.Exceptions;
+
 	/// <summary>
 	/// A RabbitMQ-target for NLog. See https://github.com/haf/NLog.RabbitMQ for documentation in Readme.md.
 	/// </summary>
@@ -179,7 +182,7 @@ namespace NLog.Targets
 		public ushort HeartBeatSeconds
 		{
 			get { return _HeartBeatSeconds; }
-			set {  _HeartBeatSeconds = value; }
+			set { _HeartBeatSeconds = value; }
 		}
 
 		bool _UseJSON;
@@ -201,43 +204,40 @@ namespace NLog.Targets
 
 		#endregion
 
-		protected override void Write(AsyncLogEventInfo logEvent)
+		protected override void Write(LogEventInfo logEvent)
 		{
-			var continuation = logEvent.Continuation;
 			var basicProperties = GetBasicProperties(logEvent);
 			var message = GetMessage(logEvent);
-			var routingKey = GetTopic(logEvent.LogEvent);
+			var routingKey = GetTopic(logEvent);
 
 			if (_Model == null || !_Model.IsOpen)
 				StartConnection();
-
-			if (_Model == null || !_Model.IsOpen)
-			{
-				AddUnsent(routingKey, basicProperties, message);
-				return;
-			}
 
 			try
 			{
 				CheckUnsent();
 				Publish(message, basicProperties, routingKey);
-				return;
+			}
+			catch (OperationInterruptedException e)
+			{
+				// This traps network/channel errors detected by the RabbitMQ client
+				// The shutdown reason could be inspected to determine if the connection is still available for use
+				this.AddUnsent(routingKey, basicProperties, message);
+				InternalLogger.Warn("Unable to send message: " + e.Message);
+				throw;
 			}
 			catch (IOException e)
 			{
 				AddUnsent(routingKey, basicProperties, message);
-				continuation(e);
-				//InternalLogger.Error("Could not send to RabbitMQ instance! {0}", e.ToString());
+				InternalLogger.Warn("Could not send to RabbitMQ instance! {0}", e.ToString());
+				throw;
 			}
 			catch (ObjectDisposedException e)
 			{
 				AddUnsent(routingKey, basicProperties, message);
-				continuation(e);
 				//InternalLogger.Error("Could not write data to the network stream! {0}", e.ToString());
+				throw;
 			}
-
-			ShutdownAmqp(_Connection, new ShutdownEventArgs(ShutdownInitiator.Application,
-															Constants.ChannelError, "Could not talk to RabbitMQ instance"));
 		}
 
 		private void AddUnsent(string routingKey, IBasicProperties basicProperties, byte[] message)
@@ -261,10 +261,7 @@ namespace NLog.Targets
 
 		private void Publish(byte[] bytes, IBasicProperties basicProperties, string routingKey)
 		{
-			_Model.BasicPublish(_Exchange,
-								routingKey,
-								true, false, basicProperties,
-								bytes);
+			_Model.BasicPublish(_Exchange, routingKey, true, false, basicProperties, bytes);
 		}
 
 		private string GetTopic(LogEventInfo eventInfo)
@@ -274,14 +271,14 @@ namespace NLog.Targets
 			return routingKey;
 		}
 
-		private byte[] GetMessage(AsyncLogEventInfo info)
+		private byte[] GetMessage(LogEventInfo info)
 		{
-			return _Encoding.GetBytes(MessageFormatter.GetMessageInner(_UseJSON, Layout, info.LogEvent));
+			return _Encoding.GetBytes(MessageFormatter.GetMessageInner(_UseJSON, Layout, info));
 		}
 
-		private IBasicProperties GetBasicProperties(AsyncLogEventInfo loggingEvent)
+		private IBasicProperties GetBasicProperties(LogEventInfo loggingEvent)
 		{
-			var @event = loggingEvent.LogEvent;
+			var @event = loggingEvent;
 
 			return new BasicProperties
 				{
@@ -300,53 +297,87 @@ namespace NLog.Targets
 			StartConnection();
 		}
 
+		private readonly object _ConnectionLock = new object();
 		/// <summary>
-		/// Never throws
+		/// Never throws, blocks until connection is established
 		/// </summary>
-		[MethodImpl(MethodImplOptions.Synchronized)]
 		private void StartConnection()
 		{
-			var t = Task.Factory.StartNew(() =>
+			int connectionAttempts = 0;
+			while (!Closed)
+			{
+				connectionAttempts++;
+				// Shared lock with ShutdownAmqp, since they both access _Model and _Connection
+				lock (this._ConnectionLock)
 				{
+					if (Closed) return; // double checking to make sure we don't open a connection during shutdown
+					// If we already have an open Model, don't open a new one
+					if (_Model != null && _Model.IsOpen) return;
+
 					try
 					{
-						_Connection = GetConnectionFac().CreateConnection();
-						_Connection.ConnectionShutdown += ShutdownAmqp;
+						while (_Connection == null || !_Connection.IsOpen)
+						{
+							// If the connection is closed, dispose of it to make sure resources are released immediately
+							if (_Connection != null)
+							{
+								try
+								{
+									_Connection.Dispose();
+								}
+								catch (OperationInterruptedException)
+								{
+								}
+								catch (IOException)
+								{
+								}
+								_Connection = null;
+							}
+							// If we need a new connection, we need a new model, so dispose of the existing model
+							if (_Model != null)
+							{
+								_Model.Dispose();
+								_Model = null;
+							}
+
+							// Open a new connection
+							ConnectionFactory factory = GetConnectionFac();
+							try
+							{
+								_Connection = factory.CreateConnection();
+							}
+							catch (BrokerUnreachableException)
+							{
+								InternalLogger.Error(
+									"Could not reach RabbitMQ broker at {0}, attempt {1}",
+									factory.HostName,
+									connectionAttempts);
+							}
+						}
 
 						try
 						{
 							_Model = _Connection.CreateModel();
+							_Model.ExchangeDeclare(_Exchange, ExchangeType.Topic, _Durable);
 						}
 						catch (Exception e)
 						{
-							InternalLogger.Error("could not create model, {0}", e);
-						}
-
-						if (_Model != null)
-						{
-							try
+							InternalLogger.Error("Could not create model, {0}", e);
+							if (_Model != null)
 							{
-								_Model.ExchangeDeclare(_Exchange, ExchangeType.Topic, _Durable);
-							}
-							catch (Exception e)
-							{
-								if (_Model != null)
-								{
-									_Model.Dispose();
-									_Model = null;
-								}
-								InternalLogger.Error(string.Format("could not declare exchange, {0}", e));
+								_Model.Dispose();
+								_Model = null;
 							}
 						}
 					}
 					catch (Exception e)
 					{
-						InternalLogger.Error(string.Format("could not connect to Rabbit instance, {0}", e));
+						InternalLogger.Error(string.Format("Could not connect to Rabbit instance, {0}", e));
 					}
-				});
-
-			if (!t.Wait(TimeSpan.FromMilliseconds(30)))
-				InternalLogger.Warn("starting connection-task timed out, continuing");
+				}
+				// simple exponentially increasing wait time for each attempt, max at once a minute
+				Thread.Sleep(Math.Min(250 * connectionAttempts * connectionAttempts, 60000));
+			}
 		}
 
 		private ConnectionFactory GetConnectionFac()
@@ -362,46 +393,51 @@ namespace NLog.Targets
 			};
 		}
 
-		[MethodImpl(MethodImplOptions.Synchronized)]
-		private void ShutdownAmqp(IConnection connection, ShutdownEventArgs reason)
+		private void ShutdownAmqp()
 		{
-			// I can't make this NOT hang when RMQ goes down
-			// and then a log message is sent...
-
-			try
+			// Shared lock with StartConnection
+			lock (this._ConnectionLock)
 			{
-				if (_Model != null && _Model.IsOpen 
-					&& reason.ReplyCode != Constants.ChannelError
-					&& reason.ReplyCode != Constants.ConnectionForced)
-					_Model.Abort(); //_Model.Close();
-			}
-			catch (Exception e)
-			{
-				InternalLogger.Error("could not close model, {0}", e);
-			}
-
-			try
-			{
-				if (connection != null && connection.IsOpen)
+				try
 				{
-					connection.ConnectionShutdown -= ShutdownAmqp;
-					connection.Close(reason.ReplyCode, reason.ReplyText, 1000);
-					connection.Abort(1000); // you get 2 seconds to shut down!
+					if (_Model != null && _Model.IsOpen)
+					{
+						_Model.Abort();
+						_Model = null;
+					}
 				}
-			}
-			catch (Exception e)
-			{
-				InternalLogger.Error("could not close connection, {0}", e);
+				catch (Exception e)
+				{
+					InternalLogger.Error("Error closing model, {0}", e);
+				}
+
+				try
+				{
+					if (_Connection != null && _Connection.IsOpen)
+					{
+						_Connection.Close(Constants.ReplySuccess, "closing appender", 1000);
+						_Connection.Abort(1000); // you get 2 seconds to shut down!
+						_Connection.Dispose();
+					}
+					_Connection = null;
+				}
+				catch (Exception e)
+				{
+					InternalLogger.Error("Error closing connection, {0}", e);
+				}
 			}
 		}
 
 		// Dispose calls CloseTarget!
-
+		protected bool Closed;
 		protected override void CloseTarget()
 		{
-			ShutdownAmqp(_Connection,
-						 new ShutdownEventArgs(ShutdownInitiator.Application, Constants.ReplySuccess, "closing appender"));
-			
+			if (!Closed)
+			{
+				Closed = true;
+				ShutdownAmqp();
+			}
+
 			base.CloseTarget();
 		}
 	}
