@@ -11,6 +11,7 @@ using NLog.Layouts;
 namespace NLog.Targets
 {
 	using System.Threading;
+	using System.Threading.Tasks;
 
 	using global::RabbitMQ.Client.Exceptions;
 
@@ -290,14 +291,7 @@ namespace NLog.Targets
 				};
 		}
 
-		protected override void InitializeTarget()
-		{
-			base.InitializeTarget();
-
-			StartConnection();
-		}
-
-		private readonly object _ConnectionLock = new object();
+	    private readonly object _ConnectionLock = new object();
 		/// <summary>
 		/// Never throws, blocks until connection is established
 		/// </summary>
